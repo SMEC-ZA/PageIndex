@@ -621,12 +621,13 @@ def create_clean_structure_for_description(structure):
 
 
 def generate_doc_description(structure, model=None):
-    prompt = f"""Your are an expert in generating descriptions for a document.
-    You are given a structure of a document. Your task is to generate a one-sentence description for the document, which makes it easy to distinguish the document from other documents.
+    prompt = f"""You are an expert in summarizing documents.
+    You are given the structure of a document. Your task is to generate a detailed summary paragraph (1 comprehensive paragraph) of the document.
+    Provide enough detail to capture the core context, primary subjects, and key entities, which makes it easy to distinguish this document from others and understand its overall purpose.
         
     Document Structure: {structure}
     
-    Directly return the description, do not include any other text.
+    Directly return the summary, do not include any other text.
     """
     response = llm_completion(model, prompt)
     return response

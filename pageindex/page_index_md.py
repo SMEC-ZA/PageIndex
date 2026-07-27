@@ -274,24 +274,24 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
         if if_add_node_text == 'no':
             # Remove text after summary generation if not requested
             tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'summary', 'prefix_summary', 'nodes'])
-        
-        if if_add_doc_description == 'yes':
-            print(f"Generating document description...")
-            # Create a clean structure without unnecessary fields for description generation
-            clean_structure = create_clean_structure_for_description(tree_structure)
-            doc_description = generate_doc_description(clean_structure, model=model)
-            return {
-                'doc_name': os.path.splitext(os.path.basename(md_path))[0],
-                'doc_description': doc_description,
-                'line_count': line_count,
-                'structure': tree_structure,
-            }
     else:
         # No summaries needed, format based on text preference
         if if_add_node_text == 'yes':
             tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'summary', 'prefix_summary', 'text', 'nodes'])
         else:
             tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'line_num', 'summary', 'prefix_summary', 'nodes'])
+            
+    if if_add_doc_description == 'yes':
+        print(f"Generating document description...")
+        # Create a clean structure without unnecessary fields for description generation
+        clean_structure = create_clean_structure_for_description(tree_structure)
+        doc_description = generate_doc_description(clean_structure, model=model)
+        return {
+            'doc_name': os.path.splitext(os.path.basename(md_path))[0],
+            'doc_description': doc_description,
+            'line_count': line_count,
+            'structure': tree_structure,
+        }
     
     return {
         'doc_name': os.path.splitext(os.path.basename(md_path))[0],
