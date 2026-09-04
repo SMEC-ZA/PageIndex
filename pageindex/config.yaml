@@ -1,6 +1,5 @@
-model: "openai/deepseek-v4-flash"
-# model: "anthropic/claude-sonnet-4-6"
-retrieve_model: "openai/deepseek-v4-flash"  # defaults to `model` if not set
+model: "openai/qwen2.5-vl-32b"
+retrieve_model: "openai/qwen2.5-vl-32b"  # defaults to `model` if not set
 toc_check_page_num: 20
 max_page_num_each_node: 10
 max_token_num_each_node: 20000
