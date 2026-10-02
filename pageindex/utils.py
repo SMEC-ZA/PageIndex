@@ -33,6 +33,8 @@ def count_tokens(text, model=None):
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
     if model:
         model = model.removeprefix("litellm/")
+        if "/" not in model:
+            model = "openai/" + model
     api_base = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY")
     max_retries = 10
@@ -70,6 +72,8 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
 async def llm_acompletion(model, prompt):
     if model:
         model = model.removeprefix("litellm/")
+        if "/" not in model:
+            model = "openai/" + model
     api_base = os.getenv("OPENAI_API_BASE") or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("LITELLM_MASTER_KEY")
     max_retries = 10
