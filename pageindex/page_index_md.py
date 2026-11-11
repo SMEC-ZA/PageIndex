@@ -7,6 +7,78 @@ try:
 except:
     from utils import *
 
+# Keep in sync with markitdown.markdown_postprocess.VLM_OUTLINE_NOISE_TITLES
+# Canonical "Image description" / "Resume" markers are intentionally NOT listed —
+# they must become PageIndex nodes so captions stay sectioned off.
+VLM_OUTLINE_NOISE_TITLES = frozenset(
+    {
+        "map description",
+        "network map description",
+        "diagram description",
+        "description of the image",
+        "key features",
+        "type: map",
+        "type: chart",
+        "type: diagram",
+        "process flowchart",
+        "observations",
+    }
+)
+
+CANONICAL_BOUNDARY_TITLES = frozenset({"image description", "resume"})
+
+_BOLD_WRAP_RE = re.compile(r"^\*\*(?P<body>.+)\*\*$")
+_NUMBERED_OUTLINE_RE = re.compile(r"^\d+(?:\.\d+)*\.?\b")
+
+
+def _normalize_outline_title(title: str) -> str:
+    t = (title or "").strip()
+    bold = _BOLD_WRAP_RE.match(t)
+    if bold:
+        t = bold.group("body").strip()
+    return t.strip().rstrip(":").strip()
+
+
+def _is_vlm_outline_noise_title(title: str) -> bool:
+    normalized = _normalize_outline_title(title).lower()
+    if not normalized:
+        return False
+    if normalized in CANONICAL_BOUNDARY_TITLES:
+        return False
+    if normalized in VLM_OUTLINE_NOISE_TITLES:
+        return True
+    for noise in VLM_OUTLINE_NOISE_TITLES:
+        if (
+            normalized.startswith(noise + " ")
+            or normalized.startswith(noise + "—")
+            or normalized.startswith(noise + "-")
+        ):
+            return True
+    return False
+
+
+def _is_numbered_outline_title(title: str) -> bool:
+    """True for real report outline titles like '2.6.1 Section …'."""
+    bare = _normalize_outline_title(title)
+    return bool(_NUMBERED_OUTLINE_RE.match(bare))
+
+
+def _should_skip_outline_heading(level: int, title: str) -> bool:
+    """Skip VLM noise at any level; skip non-numbered H5/H6 for quieter TOC.
+
+    Canonical Image description / Resume markers are kept even at H5/H6 so
+    captions become their own PageIndex nodes.
+    """
+    normalized = _normalize_outline_title(title).lower()
+    if normalized in CANONICAL_BOUNDARY_TITLES:
+        return False
+    if _is_vlm_outline_noise_title(title):
+        return True
+    if level >= 5 and not _is_numbered_outline_title(title):
+        return True
+    return False
+
+
 async def get_node_summary(node, summary_token_threshold=200, model=None):
     node_text = node.get('text')
     num_tokens = count_tokens(node_text, model=model)
@@ -53,7 +125,10 @@ def extract_nodes_from_markdown(markdown_content):
         if not in_code_block:
             match = re.match(header_pattern, stripped_line)
             if match:
+                level = len(match.group(1))
                 title = match.group(2).strip()
+                if _should_skip_outline_heading(level, title):
+                    continue
                 node_list.append({'node_title': title, 'line_num': line_num})
 
     return node_list, lines

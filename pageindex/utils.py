@@ -615,22 +615,71 @@ async def generate_summaries_for_structure(structure, model=None):
     return structure
 
 
+# When MarkItDown emits page-sliced markdown, headings are often
+# "Section / Page N" — titles alone cannot support a useful doc description.
+_LOW_SIGNAL_TITLE_RE = re.compile(
+    r"(?i)^\s*(?:#{1,6}\s*)?(?:section\s*/\s*)?page\s*\d+\s*$"
+    r"|^\s*(?:#{1,6}\s*)?section\s*/\s*page\s*\d+"
+)
+DOC_DESC_EXCERPT_MAX_CHARS = 400
+
+
+def is_low_signal_title(title: str) -> bool:
+    """True when a heading carries little topical signal (e.g. Section / Page 12)."""
+    t = (title or "").strip()
+    if not t:
+        return True
+    return bool(_LOW_SIGNAL_TITLE_RE.search(t))
+
+
+def text_excerpt_for_outline(text: str, max_chars: int = DOC_DESC_EXCERPT_MAX_CHARS) -> str:
+    """Strip images/markup noise and return a short prose excerpt for the outline."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+    cleaned = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cleaned)
+    cleaned = re.sub(r"[`*_>#]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Drop a leading page-marker echo if present.
+    cleaned = re.sub(
+        r"(?i)^(?:section\s*/\s*)?page\s*\d+\s*",
+        "",
+        cleaned,
+    ).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    truncated = cleaned[:max_chars]
+    if " " in truncated:
+        truncated = truncated.rsplit(" ", 1)[0]
+    return truncated.strip()
+
+
 def create_clean_structure_for_description(structure):
     """
-    Create a clean structure for document description generation,
-    excluding unnecessary fields like 'text'.
+    Create a clean structure for document description generation.
+
+    Keeps titles/summaries. For low-signal titles (page dumps), also keeps a
+    short text excerpt so the LLM has real topical content — not just
+    "Section / Page N" labels.
     """
     if isinstance(structure, dict):
         clean_node = {}
-        # Only include essential fields for description
         for key in ['title', 'node_id', 'summary', 'prefix_summary']:
             if key in structure:
                 clean_node[key] = structure[key]
-        
-        # Recursively process child nodes
+
+        title = (clean_node.get('title') or '').strip()
+        text = structure.get('text') or ''
+        # Prefer explicit summaries; otherwise borrow body when the title is weak.
+        if text and not (clean_node.get('summary') or clean_node.get('prefix_summary')):
+            if is_low_signal_title(title) or not title:
+                excerpt = text_excerpt_for_outline(text)
+                if excerpt:
+                    clean_node['text_excerpt'] = excerpt
+
         if 'nodes' in structure and structure['nodes']:
             clean_node['nodes'] = create_clean_structure_for_description(structure['nodes'])
-        
+
         return clean_node
     elif isinstance(structure, list):
         return [create_clean_structure_for_description(item) for item in structure]
@@ -638,17 +687,178 @@ def create_clean_structure_for_description(structure):
         return structure
 
 
+# Token budgets for doc description on ~32k-context models (e.g. Qwen via LiteLLM).
+DOC_DESC_SINGLE_MAX_TOKENS = 12000
+DOC_DESC_BATCH_MAX_TOKENS = 8000
+DOC_DESC_MAX_REDUCE_DEPTH = 8
+
+_DOC_DESC_LOGGER = logging.getLogger(__name__)
+
+
+def flatten_structure_to_outline(structure, depth=0):
+    """Flatten a cleaned tree into ordered outline lines: '{indent}{node_id}: {title}'."""
+    lines = []
+    if isinstance(structure, list):
+        for item in structure:
+            lines.extend(flatten_structure_to_outline(item, depth))
+        return lines
+    if not isinstance(structure, dict):
+        return lines
+
+    title = (structure.get('title') or '').strip()
+    excerpt = (structure.get('text_excerpt') or '').strip()
+    if title or excerpt:
+        node_id = (structure.get('node_id') or '').strip()
+        indent = '  ' * depth
+        prefix = f"{node_id}: " if node_id else ""
+        label = title or "(untitled)"
+        line = f"{indent}{prefix}{label}"
+        extras = []
+        for key in ('summary', 'prefix_summary', 'text_excerpt'):
+            value = (structure.get(key) or '').strip()
+            if value:
+                extras.append(value)
+        if extras:
+            line = f"{line} — {'; '.join(extras)}"
+        lines.append(line)
+
+    children = structure.get('nodes') or []
+    if children:
+        lines.extend(flatten_structure_to_outline(children, depth + 1))
+    return lines
+
+
+def _pack_outline_batches(lines, model=None, max_tokens=DOC_DESC_BATCH_MAX_TOKENS):
+    """Pack consecutive outline lines into batches under max_tokens."""
+    if not lines:
+        return []
+
+    batches = []
+    current = []
+    current_tokens = 0
+
+    for line in lines:
+        line_tokens = count_tokens(line, model=model)
+        # Single oversize line still gets its own batch so progress can continue.
+        if current and current_tokens + line_tokens + 1 > max_tokens:
+            batches.append(current)
+            current = []
+            current_tokens = 0
+        current.append(line)
+        current_tokens += line_tokens + (1 if len(current) > 1 else 0)
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _doc_description_from_outline_text(outline_text, model=None, kind='full'):
+    if kind == 'partial':
+        prompt = f"""You are an expert in summarizing documents.
+You are given part of a document's outline (section headings and any short text excerpts). Write one summary paragraph covering only this part.
+Capture the main subjects and key entities. Ground the summary only in the provided text; do not invent unrelated domains.
+Directly return the summary, do not include any other text.
+
+Partial Document Outline:
+{outline_text}
+"""
+    elif kind == 'reduce':
+        prompt = f"""You are an expert in summarizing documents.
+You are given partial summaries of different sections of the same document. Combine them into one detailed summary paragraph (1 comprehensive paragraph) of the whole document.
+Provide enough detail to capture the core context, primary subjects, and key entities, which makes it easy to distinguish this document from others and understand its overall purpose.
+Directly return the summary, do not include any other text.
+
+Partial Summaries:
+{outline_text}
+"""
+    else:
+        prompt = f"""You are an expert in summarizing documents.
+You are given the structure of a document (section titles, and where present short text excerpts). Your task is to generate a detailed summary paragraph (1 comprehensive paragraph) of the document.
+Provide enough detail to capture the core context, primary subjects, and key entities, which makes it easy to distinguish this document from others and understand its overall purpose.
+Ground the summary only in the provided outline/excerpts. Do not invent unrelated domains or systems that are not evidenced there.
+
+Document Structure:
+{outline_text}
+
+Directly return the summary, do not include any other text.
+"""
+    return llm_completion(model, prompt)
+
+
+def _map_reduce_outline_lines(lines, model=None, depth=0):
+    """Map-reduce outline lines into one document description."""
+    if not lines:
+        return ""
+
+    if depth > DOC_DESC_MAX_REDUCE_DEPTH:
+        _DOC_DESC_LOGGER.error(
+            "doc_description exceeded max reduce depth=%d lines=%d; aborting",
+            DOC_DESC_MAX_REDUCE_DEPTH, len(lines),
+        )
+        return ""
+
+    outline_text = "\n".join(lines)
+    total_tokens = count_tokens(outline_text, model=model)
+
+    if total_tokens <= DOC_DESC_SINGLE_MAX_TOKENS:
+        kind = 'reduce' if depth > 0 else 'full'
+        _DOC_DESC_LOGGER.info(
+            "doc_description path=%s depth=%d lines=%d tokens=%d",
+            kind, depth, len(lines), total_tokens,
+        )
+        return _doc_description_from_outline_text(outline_text, model=model, kind=kind)
+
+    batches = _pack_outline_batches(lines, model=model, max_tokens=DOC_DESC_BATCH_MAX_TOKENS)
+
+    # One unsplittable oversize chunk: attempt a single call rather than looping forever.
+    if len(batches) <= 1:
+        kind = 'reduce' if depth > 0 else 'partial'
+        _DOC_DESC_LOGGER.warning(
+            "doc_description unsplittable oversize payload depth=%d tokens=%d; attempting single %s call",
+            depth, total_tokens, kind,
+        )
+        return _doc_description_from_outline_text(outline_text, model=model, kind=kind)
+
+    _DOC_DESC_LOGGER.info(
+        "doc_description path=map_reduce depth=%d lines=%d tokens=%d batches=%d",
+        depth, len(lines), total_tokens, len(batches),
+    )
+
+    partials = []
+    for i, batch in enumerate(batches):
+        batch_text = "\n".join(batch)
+        batch_tokens = count_tokens(batch_text, model=model)
+        _DOC_DESC_LOGGER.info(
+            "doc_description map batch=%d/%d lines=%d tokens=%d",
+            i + 1, len(batches), len(batch), batch_tokens,
+        )
+        partial = _doc_description_from_outline_text(batch_text, model=model, kind='partial')
+        if not partial:
+            _DOC_DESC_LOGGER.error(
+                "doc_description map batch=%d/%d returned empty (tokens=%d); aborting",
+                i + 1, len(batches), batch_tokens,
+            )
+            return ""
+        partials.append(partial.strip())
+
+    return _map_reduce_outline_lines(partials, model=model, depth=depth + 1)
+
+
 def generate_doc_description(structure, model=None):
-    prompt = f"""You are an expert in summarizing documents.
-    You are given the structure of a document. Your task is to generate a detailed summary paragraph (1 comprehensive paragraph) of the document.
-    Provide enough detail to capture the core context, primary subjects, and key entities, which makes it easy to distinguish this document from others and understand its overall purpose.
-        
-    Document Structure: {structure}
-    
-    Directly return the summary, do not include any other text.
     """
-    response = llm_completion(model, prompt)
-    return response
+    Generate a document-level summary from a cleaned structure.
+
+    Small outlines use a single LLM call. Large outlines use token-capped
+    map-reduce so the prompt fits ~32k-context models.
+    """
+    lines = flatten_structure_to_outline(structure)
+    if not lines:
+        # Fallback: previous behavior for unexpected empty clean trees
+        outline_text = str(structure)
+        _DOC_DESC_LOGGER.info("doc_description path=fallback_raw empty_outline=True")
+        return _doc_description_from_outline_text(outline_text, model=model, kind='full')
+
+    return _map_reduce_outline_lines(lines, model=model, depth=0)
 
 
 def reorder_dict(data, key_order):
